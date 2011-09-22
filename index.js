@@ -63,22 +63,27 @@ exports.Queue = Queue;
 Queue.prototype.write = function (payload, callback) {
   var self = this;
 
-  var id = uuid();
+  var id              = uuid()
+    , json            = JSON.stringify
+      ( { id          : id
+        , payload     : payload
+        , error_count : 0
+        , errors      : []
+        , modified    : Date.now()
+        }
+      )
 
   // Push the job.
-  self.client.rpush(self.prefix + 'queue:' + self.name, JSON.stringify({
-    id: id,
-    payload: payload,
-    error_count: 0,
-    errors: [],
-    modified: Date.now()
-  }), function (error, length) {
+  self.client.multi()
+  self.client.rpush(self.prefix + 'queue:' + self.name, json);
+  self.client.publish(self.prefix + ':message', json)
+  self.client.exec(function (error) {
     if (error) {
       return handleError(error, callback);
     }
 
     if (callback) callback(null, id);
-  });
+  })
 
   return id;
 };
