@@ -76,7 +76,7 @@ Queue.prototype.write = function (payload, callback) {
   // Push the job.
   self.client.multi()
   self.client.rpush(self.prefix + 'queue:' + self.name, json);
-  self.client.publish(self.prefix + ':message', json)
+  self.client.publish(self.prefix + 'message', json)
   self.client.exec(function (error) {
     if (error) {
       return handleError(error, callback);
