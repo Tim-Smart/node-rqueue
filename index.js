@@ -6,6 +6,9 @@ var redis  = require('node-redis')
   , uuid   = require('node-uuid')
   , util   = require('util')
 
+// Function for map calls
+var mapToString = function (id) { return id.toString() }
+
 /**
  * Log for a async callback
  *
@@ -15,17 +18,6 @@ var redis  = require('node-redis')
 function asyncLog (error, data) {
   if (error) return console.error(error)
   console.log(data)
-}
-
-/**
- * Handle an error appropiatly.
- *
- * @param {Error} error: The error object in question.
- * @param {Function} callback: Optional callback to pass error to.
- */
-var handleError = function (error, callback) {
-  if (callback) return callback(error)
-  throw error
 }
 
 /**
@@ -46,6 +38,7 @@ var Queue = function (options) {
   queue.port        = options.port
   queue.auth        = options.auth
 
+  queue.timeout     = options.timeout || null
   queue.concurrency = options.concurrency || 1
   queue.processing  = 0
   queue._prefix     = ''
@@ -61,8 +54,8 @@ var Queue = function (options) {
   }
 
   // On blpop
-  queue.onPop       = function onPop (error) {
-    if (error) return queue.emit('error', error)
+  queue._onPop       = function onPop (error) {
+    if (error) return queue._done(error)
     queue._next()
 
     queue.client.watch(queue._prefix + ':queued')
@@ -71,10 +64,20 @@ var Queue = function (options) {
 
   // On zrevrange
   function gotQueued (error, job_id) {
-    if (error) return queue.emit('error', error)
-    if (!job_id || !job_id[0]) return
+    if (error) return queue._done(error)
+    if (!job_id || !job_id[0]) return queue._done()
 
-    queue._processJob(job_id[0].toString())
+    queue.client.hget(queue._prefix + ':jobs', job_id[0].toString(), gotJob)
+  }
+
+  function gotJob (error, data) {
+    if (error) return queue._done(error)
+
+    try {
+      queue._processJob(queue._returnJob(data))
+    } catch (error) {
+      return queue._done(error)
+    }
   }
 
   queue.client.on('error', queue._onError)
@@ -106,12 +109,79 @@ Queue.prototype.refreshKeys = function refreshKeys () {
 }
 
 /**
+ * If a previous worker crashed, migrate its running jobs back to
+ * the queue.
+ *
+ * @param {String} id
+ * @param @optional {Function} callback
+ */
+Queue.prototype.migrate = function migrate (id, callback) {
+  var queue   = this
+  var client  = queue.client
+
+  function onJobIds (error, ids) {
+    if (error) {
+      if (callback) return callback(error)
+      return queue.emit('error', error)
+    }
+    if (!ids || 0 === ids.length) {
+      if (callback) return callback()
+      return
+    }
+
+    ids = ids.map(mapToString)
+    ids.unshift(queue._prefix + ':jobs')
+
+    client.hmget(ids, gotJobs)
+  }
+
+  function gotJobs (error, jobs) {
+    if (error) {
+      if (callback) return callback(error)
+      return queue.emit('error', error)
+    }
+
+    client.multi()
+
+    for (var i = 0, il = jobs.length; i < il; i++) {
+      try {
+        queue
+          ._returnJob(jobs[i])
+          .addMessage('Retry set on "' + queue.name + ':' + queue.id + '".')
+          .forward('queued', null, true)
+      } catch (error) {}
+    }
+
+    client.del(queue._prefix + ':running:' + id)
+    client.exec(callback)
+  }
+
+  client.zrange(queue._prefix + ':running:' + id, '0', '-1', onJobIds)
+
+  return queue
+}
+
+/**
  * Adds a new job to the queue.
  *
  * @param {Object} payload: The data payload to enqueue.
  * @param {Function} callback
  */
 Queue.prototype.write = function write (payload, callback) {
+  var queue       = this
+  var job         = queue.createJob(payload)
+
+  job.forward('queued', callback)
+
+  return job
+}
+
+/**
+ * Create a job and call save / forward manually.
+ *
+ * @param {Object} payload
+ */
+Queue.prototype.createJob = function createJob (payload) {
   var queue       = this
   var now         = Date.now()
   var job         = new Job(
@@ -125,13 +195,10 @@ Queue.prototype.write = function write (payload, callback) {
     , msgs        : []
     , payload     : payload
     , created     : now
-    , updated     : now
+    , updated     : null
     }
   , true
   )
-
-  // Push the job.
-  job.forward('queued', callback)
 
   return job
 }
@@ -169,7 +236,8 @@ Queue.prototype._returnJob = function returnJob (data, callback) {
   try {
     data    = JSON.parse(data.toString())
   } catch (error) {
-    return callback(error)
+    if (callback) return callback(error)
+    throw error
   }
 
   var job   = new Job(queue, data)
@@ -195,7 +263,7 @@ Queue.prototype.resume = function resume () {
 Queue.prototype._next = function next () {
   var queue = this
 
-  if (queue.paused) return
+  if (queue.paused || !queue.writable) return
 
   if (queue.processing >= queue.concurrency) {
     return queue
@@ -203,7 +271,25 @@ Queue.prototype._next = function next () {
 
   ;++queue.processing
 
-  queue.bclient.blpop(queue._prefix + ':listen', queue.onPop)
+  queue.bclient.blpop(queue._prefix + ':listen', '0', queue._onPop)
+
+  return queue
+}
+
+/**
+ * Done a job, or errored before we got one.
+ *
+ * @param @optional {Error} error
+ */
+Queue.prototype._done = function done (error) {
+  var queue = this
+
+  ;--queue.processing
+  if (error) {
+    queue.emit('error', error)
+  }
+
+  queue._next()
 
   return queue
 }
@@ -212,30 +298,39 @@ Queue.prototype._next = function next () {
  * Process a job. At this stage watch has been called on the queued sorted set
  * and we have a job id.
  */
-Queue.prototype._processJob = function processJob (job_id) {
+Queue.prototype._processJob = function processJob (job) {
   var queue   = this
   var client  = queue.client
   var status  = 'running:' + queue.id
   var now     = Date.now()
 
+  job.status  = status
+  job.updated = now
+
   client.multi()
-  client.hget(queue._prefix + ':jobs', job_id)
-  client.zrem(queue._prefix + ':queued', job_id)
-  client.zadd(queue._prefix + ':' + status, now, job_id)
+  client.zrem(queue._prefix + ':queued', job.id)
+  client.zadd(queue._prefix + ':' + status, now, job.id)
+  client.hset(queue._prefix + ':jobs', job.id, JSON.stringify(job))
+  client.publish(queue._prefix + ':save' , job.id)
+  client.publish(queue._prefix + ':running' , job.id)
 
   client.exec(function (error, results) {
-    if (error) return queue.emit('error', error)
-    if (results === null) {
-      client.watch(queue._prefix + ':queued')
-      return queue._processJob(job_id)
+    if (error) return queue._done(error)
+    if (results === null) return queue._done()
+
+    if (job.timeout) {
+      job._timer = setTimeout(job._onTimeout, job.timeout, job)
     }
 
-    queue.emit('data', queue._returnJob(results[0]))
+    queue.emit('data', job)
   })
 }
 
 /**
- * Start the queue listener
+ * Start the queue listener.
+ *
+ * @param @optional {String} id
+ * @param @optional {Function} callback
  */
 Queue.prototype.listen = function listen (callback) {
   var queue     = this
@@ -249,7 +344,7 @@ Queue.prototype.listen = function listen (callback) {
   , queue.started.getTime()
   , queue.id
   , function (error) {
-      if (error) return self.emit('error', error)
+      if (error) return queue.emit('error', error)
       if (callback) callback()
       queue._next()
     }
@@ -260,8 +355,10 @@ Queue.prototype.listen = function listen (callback) {
 
 /**
  * Stop yol horses. Shut her down!
+ * You should always call this if you want to register the queue
+ * before shutting down your program.
  */
-Queue.prototype.end = function end () {
+Queue.prototype.end = function end (callback) {
   var queue     = this
 
   if (queue.bclient) {
@@ -272,7 +369,10 @@ Queue.prototype.end = function end () {
     queue.sclient.destroy()
     queue.sclient = null
   }
-  queue.client.end()
+  queue.client.zrem(queue._prefix + ':workers', queue.id)
+  queue.client.end(callback)
+
+  Filter.prototype.end.call(queue)
 
   return queue
 }
@@ -290,7 +390,7 @@ var Job = function (parent, data, is_new) {
   job.id          = data.id
   job.status      = data.status
   job.priority    = +data.priority
-  job.timeout     = data.timeout
+  job.timeout     = data.timeout ? +data.timeout : null
   job.payload     = data.payload
   job.retries     = data.retries
   job.msg_count   = data.msg_count
@@ -300,6 +400,7 @@ var Job = function (parent, data, is_new) {
 
   job.is_new      = is_new || false
   job.old_status  = job.status
+  job._timer      = null
 
   job.prefix      = parent.prefix
   job._prefix     = parent._prefix
@@ -311,6 +412,20 @@ var Job = function (parent, data, is_new) {
 }
 
 exports.Job = Job
+
+/**
+ * Called when a job times out.
+ * This function is usually not called with job set to this.
+ *
+ * @param {Job} job
+ */
+Job.prototype._onTimeout = function onTimeout (job) {
+  job._timer  = null
+  job.forward('timeout')
+  job.parent._done()
+
+  return job
+}
 
 /**
  * Add an message to the job.
@@ -351,10 +466,11 @@ Job.prototype.toJSON = function () {
     { id        : job.id
     , status    : job.status
     , priority  : job.priority
-    , payload   : job.payload
     , retries   : job.retries
     , msg_count : job.msg_count
     , msgs      : job.msgs
+    , timeout   : job.timeout
+    , payload   : job.payload
     , created   : job.created
     , updated   : job.updated
     }
@@ -368,18 +484,17 @@ Job.prototype.toJSON = function () {
  */
 Job.prototype.save = function save (callback) {
   var job     = this
+  var client  = job.client
 
   job.updated = Date.now()
 
-  // We won't do a multi here, as usually it has been called elsewhere.
-  job.client.hset(
-    self.prefix + 'rq:' + self.queue + ':jobs'
-  , job.id
-  , JSON.stringify(job)
-  , callback
-  )
+  if (job.is_new) {
+    job.addMessage('Created on "' + job.queue + ':' + job.parent.id + '".')
+  }
 
-  job.client.publish(self.prefix + 'rq:' + job.queue + ':save' , job.id)
+  // We won't do a multi here, as usually it has been called elsewhere.
+  client.hset([job._prefix + ':jobs', job.id, JSON.stringify(job)], callback)
+  client.publish(job._prefix + ':save' , job.id)
 
   return job
 }
@@ -389,26 +504,24 @@ Job.prototype.save = function save (callback) {
  *
  * @param {String} dest
  * @param {Function} callback
+ * @param {Boolean} multi : Already in a multi?
  */
-Job.prototype.forward = function forward (dest, callback) {
+Job.prototype.forward = function forward (dest, callback, multi) {
   var job     = this
   var client  = job.client
   var score   = 0
-
-  job.status  = dest
 
   if (!callback) {
     callback  = job.parent._onError
   }
 
-  if (job.is_new) {
-    client.multi()
-  } else {
-    client.watch(job._prefix + ':' + job.old_status)
-    client.multi()
-    client.zrem(job._prefix + ':' + job.old_status, job.id)
+  if (!multi) client.multi()
+
+  if (!job.is_new) {
+    client.zrem(job._prefix + ':' + job.status, job.id)
   }
 
+  job.status  = dest
   job.save()
   score       = job.updated
 
@@ -419,20 +532,17 @@ Job.prototype.forward = function forward (dest, callback) {
     client.rpush(job._prefix + ':listen', '1')
   }
 
-  client.zadd(
-    job._prefix ':' + job.status
-  , score
-  , job.id
-  )
+  client.zadd(job._prefix + ':' + job.status, score, job.id)
   client.publish(job._prefix + ':' + job.status, job.id)
 
-  function onExec (error, data) {
-    if (error) return callback(error)
-    if (null === data) return job.forward(dest, callback)
-    callback(null, job)
-  }
+  if (!multi) {
+    function onExec (error, data) {
+      if (error) return callback(error)
+      callback(null, job)
+    }
 
-  client.exec(onExec)
+    client.exec(onExec)
+  }
 
   return job
 }
@@ -444,7 +554,9 @@ Job.prototype.forward = function forward (dest, callback) {
  */
 Job.prototype.retry = function (error, callback) {
   var job = this
-  if (job.timeout) cleartimeout(job.timeout)
+  if (job.status === 'timeout') return false
+
+  if (job._timer) clearTimeout(job._timer)
 
   if ('function' === typeof error) {
     callback  = error
@@ -456,9 +568,10 @@ Job.prototype.retry = function (error, callback) {
   if (error) {
     job.addError(error)
   }
-  job.addMessage('Retrying on "' + job.queue + ':' + job.parent.id + '".')
+  job.addMessage('Retry set on "' + job.queue + ':' + job.parent.id + '".')
 
   job.forward('queued', callback)
+  job.parent._done()
 
   return job
 }
@@ -468,13 +581,18 @@ Job.prototype.retry = function (error, callback) {
  *
  * @param {Error} error
  */
-Job.prototype.done = function done (error) {
-  if (job.status === 'timeout') return
-
+Job.prototype.done = function done (error, callback) {
   var job   = this
+  if (job.status === 'timeout') return false
+
   var dest  = ''
 
-  if (job.timeout) cleartimeout(job.timeout)
+  if (job._timer) clearTimeout(job._timer)
+
+  if ('function' === typeof error) {
+    callback  = error
+    error     = null
+  }
 
   // Move to inactive list
   if (error) {
@@ -486,6 +604,7 @@ Job.prototype.done = function done (error) {
   }
 
   job.forward(dest, callback)
+  job.parent._done()
 
   return job
 }
