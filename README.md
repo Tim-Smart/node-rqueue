@@ -22,7 +22,7 @@ var q       = q.createQueue(
 
 // Start the worker
 q.listen()
-console.log('Worker, q.id, 'started')
+console.log('Worker', q.id, 'started')
 
 // Listen for jobs. Emits rq.Job objects
 q.on('data', function (job) {
