@@ -548,6 +548,23 @@ Job.prototype.forward = function forward (dest, callback, multi) {
 }
 
 /**
+ * Emit a event, like progress for example.
+ *
+ * @param {String} event
+ * @param {String} message
+ */
+Job.prototype.emit = function emit (event, message, callback) {
+  var job = this
+
+  job.client.publish(
+    [job._prefix + ':' + event + ':' + job.id, message]
+  , callback
+  )
+
+  return job
+}
+
+/**
  * Re-process the job by adding back to the queue.
  *
  * @param {Function} callback: The optional callback
