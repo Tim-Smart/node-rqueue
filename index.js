@@ -187,7 +187,7 @@ Queue.prototype.createJob = function createJob (payload) {
   var job         = new Job(
     queue
   , { id          : uuid()
-    , status      : 'queued'
+    , status      : null
     , priority    : 1
     , timeout     : queue.timeout
     , retries     : 0
@@ -478,6 +478,25 @@ Job.prototype.toJSON = function () {
 }
 
 /**
+ * Remove the job from redis
+ *
+ * @param {Function} callback
+ * @param {Boolean} @optional multi : Are we already in a multi?
+ */
+Job.prototype.remove = function remove (callback, multi) {
+  var job     = this
+  var client  = job.client
+
+  if (!multi) client.multi()
+  client.hdel(job._prefix + ':jobs', job.id)
+  if (job.status) client.zrem(job._prefix + ':' + job.status, job.id)
+  client.publish(job._prefix + ':remove', job.id)
+  if (!multi) client.exec(callback)
+
+  return job
+}
+
+/**
  * Save a job.
  *
  * @param {Function} callback
@@ -490,6 +509,7 @@ Job.prototype.save = function save (callback) {
 
   if (job.is_new) {
     job.addMessage('Created on "' + job.queue + ':' + job.parent.id + '".')
+    client.publish(job._prefix + ':new', job.id)
   }
 
   // We won't do a multi here, as usually it has been called elsewhere.

@@ -1,63 +1,101 @@
-Description
+node-rqueue
 -----------
 
-Node-RQueue is a simple Redis based message queue for communicating between multiple platforms.
+node-rqueue is a simple Redis based work queue for communicating between multiple platforms.
 
-It uses a easy to implement message paradigm within Redis lists.
-
-An example message:
-
-	{
-	  id: UUID,
-	  payload: 'JSON DATA',
-	  errors: ['HTTP 404'],
-	  error_count: 1
-	}
-
-Messages are put onto the list with `rpush`, then the client listens for messages with the `blpop` command.
 
 Usage
 -----
 
-queue-server.js:
+```js
+var rq      = require('rqueue')
+var assert  = require('assert').ok
+var q       = q.createQueue(
+  { host    : '127.0.0.1'
+  , port    : 6379
+  , auth    : 'redis-password'
+  , name    : 'superq'
+  , prefix  : 'local:'
+  , timeout : 5000
+  }
+)
 
-	// Require the node-rqueue
-	var client = require('./node-rqueue');
+// Start the worker
+q.listen()
+console.log('Worker, q.id, 'started')
 
-	// Create the Queue with a redis server listening on localhost:6379
-	var user_queue = new client.Queue({
-	  name: 'user',
-	  host: 'localhost',
-	  port: 6379
-	});
+// Listen for jobs. Emits rq.Job objects
+q.on('data', function (job) {
+  console.log('Processing job', job.id)
+  job.done() // Move to `completed` status
+  // or
+  // job.retry() // Re-queue job
+  // job.done(error) // Move job to `failed` status
+  // job.retry(error)
 
-	// Add a job to the queue.
-	user_queue.push('Any JSON.strinify-able data goes in this parameter', function (error, id) {
-	  // Handle errors
-	  if (error) throw error;
-	  // Second parameter is the message/job id.
-	});
+  // Emit custom events on pubsub
+  job.emit('progress', 100)
 
-queue-worker.js:
+  // Listen for events with a redis client:
+  // redis.psubscribe('local:rq:superq:progress:*')
+  // redis.on('pmessage:local:rq:superq:progress:*', function (key) {
+  //   // Key is `local:rq:superq:progress:*job.id*`
+  //   var job_id = key.split(':').pop()
+  //   q.getJob(id, gotJob)
+  // })
+  //
+  // rqueue emits a lot of events for you. The job id is always the message.
+  // A somewhat exhaustive list:
+  // (Prefix all these with: q.prefix + ':rq:' + q.name + ':'. For the above
+  //  queue it would be `local:rq:superq:`)
+  //
+  // * Everytime a job changes (job.forward) status, a event named after the
+  //   new status is emitted. E.g.
+  //
+  //   * `queued`, `failed`, `complete`, `timeout`
+  //
+  // * Everytime a job is saved, a `save` event is emitted.
+  //   If it is a new job, `new` is emitted as well.
+  //
+  // * Everytime a job is removed, a `remove` event is emitted.
+})
 
-	// Require the node-rqueue
-	var client = require('./node-rqueue');
+// Quickly create a job and push it to 'queued'
+q.write({ my : 'data' })
+// Callback can be used as second argument.
 
-	// Create a worker for each queue.
-	var worker = client.createWorker({
-	  name: 'user',
-	  host: 'localhost',
-	  port: 6379
-	});
+// Create a job and mess with individual options.
+var job = q.createJob({ my : 'data' })
+assert(null === job.status)
+assert(0 === job.retries)
 
-	// Setup message event
-	worker.on('message', function (job) {
-	  // Process message
-	  process(job.payload);
+// Timeouts
+assert(5000 === job.timeout) // Set from default timeout in queue options
+job.timeout = 10000 // 10 seconds
 
-	  // Listen for next job
-	  worker.next();
-	});
+// Priority. Higher is more important. Default is 1
+assert(1 === job.priority)
+job.priority = 9001 // Over 9000
 
-	// Start listening.
-	worker.start();
+// Add some messages
+job.addMessage('Custom info message')
+job.addError(new Error('fail'))
+
+// Save the job and push it to the 'queued' status
+job.forward('queued', function (error) {
+  if (error) throw error
+
+  // Get a job from an id
+  q.getJob(job.id, function (error, job) {})
+})
+assert('queued' === job.status)
+
+// Or save it for forwarding later
+job.save(function (error) {})
+```
+
+
+Implement in another language
+-----------------------------
+
+TODO
