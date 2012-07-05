@@ -58,6 +58,17 @@ q.on('data', function (job) {
   //   If it is a new job, `new` is emitted as well.
   //
   // * Everytime a job is removed, a `remove` event is emitted.
+
+  // IMPORTANT if you want the worker registration / deregistration to work
+  // as expected.
+  q.end()
+
+  // If a worker has failed or crashed, the id will be in
+  // `local:rq:superq:workers` and its unfinished running jobs
+  // will be in `local:rq:superq:running:*workerid*`
+  // You can migrate the unfinished worker by:
+  //
+  // q.migrate('workerid', callback)
 })
 
 // Quickly create a job and push it to 'queued'
