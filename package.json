@@ -1,12 +1,11 @@
-{
-  "name": "rqueue",
-  "description": "A node.js implementation of RQueue, includes Worker and Queue.",
-  "version": "0.1.8",
-  "author": "Tim Smart <tim@fostle.com>",
-  "engine": [ "node 0.4.x" ],
-  "main": "./",
-  "dependencies": {
-    "node-uuid": ">=1.1.0",
-    "filter": ">=0.1.0"
+{ "name"          : "rqueue"
+, "description"   : "A node.js implementation of RQueue, includes Worker and Queue."
+, "version"       : "0.1.8"
+, "author"        : "Tim Smart <tim@fostle.com>"
+, "main"          : "./"
+, "dependencies"  :
+  { "node-uuid"   : ">=1.1.0"
+  , "filter"      : ">=0.1.0"
+  , "node-redis"  : "0.1.x"
   }
 }

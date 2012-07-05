@@ -1,10 +1,21 @@
 /**
  * Requires.
  */
-var redis  = require('./deps/node-redis'),
-    Filter = require('filter'),
-    uuid   = require('node-uuid'),
-    util   = require('util');
+var redis  = require('node-redis')
+  , Filter = require('filter')
+  , uuid   = require('node-uuid')
+  , util   = require('util')
+
+/**
+ * Log for a async callback
+ *
+ * @param {Error} error
+ * @param {Mixed} data
+ */
+function asyncLog (error, data) {
+  if (error) return console.error(error)
+  console.log(data)
+}
 
 /**
  * Handle an error appropiatly.
@@ -13,11 +24,9 @@ var redis  = require('./deps/node-redis'),
  * @param {Function} callback: Optional callback to pass error to.
  */
 var handleError = function (error, callback) {
-  if (callback) callback(error);
-  else {
-    throw error;
-  }
-};
+  if (callback) return callback(error)
+  throw error
+}
 
 /**
  * The Queue prototype used by the server to add jobs to a queue.
@@ -26,21 +35,54 @@ var handleError = function (error, callback) {
  * @param {Object} options: A hash that can contain name, host, port, auth, prefix
  */
 var Queue = function (options) {
-  var self = this;
+  Filter.call(this)
 
-  Filter.call(this);
+  var queue         = this
 
-  this.name   = options.name;
-  this.client = redis.createClient(options.port, options.host, options.auth);
-  this.prefix = options.prefix || '';
+  queue.id          = uuid()
+  queue.name        = options.name
+  queue.prefix      = options.prefix || ''
+  queue.host        = options.host
+  queue.port        = options.port
+  queue.auth        = options.auth
 
-  this.client.on('error', function (error) {
-    self.emit('error', error);
-  });
-};
+  queue.concurrency = options.concurrency || 1
+  queue.processing  = 0
+  queue._prefix     = ''
+
+  queue.client      = redis.createClient(queue.port, queue.host, queue.auth)
+  queue.bclient     = null
+  queue.sclient     = null
+
+  queue._onError    = function onError (error) {
+    if (error) {
+      queue.emit('error', error)
+    }
+  }
+
+  // On blpop
+  queue.onPop       = function onPop (error) {
+    if (error) return queue.emit('error', error)
+    queue._next()
+
+    queue.client.watch(queue._prefix + ':queued')
+    queue.client.zrevrange(queue._prefix + ':queued', '0', '0', gotQueued)
+  }
+
+  // On zrevrange
+  function gotQueued (error, job_id) {
+    if (error) return queue.emit('error', error)
+    if (!job_id || !job_id[0]) return
+
+    queue._processJob(job_id[0].toString())
+  }
+
+  queue.client.on('error', queue._onError)
+  queue.refreshKeys()
+}
 
 // Inherits from Filter.
-util.inherits(Queue, Filter);
+Queue.prototype.__proto__ = Filter.prototype
 
 /**
  * Creates a new Queue object.
@@ -49,10 +91,19 @@ util.inherits(Queue, Filter);
  * @returns {Queue}
  */
 exports.createQueue = function (options) {
-  return new Queue(options);
-};
+  return new Queue(options)
+}
 
-exports.Queue = Queue;
+exports.Queue = Queue
+
+/**
+ * Regenerate keys from current prefix and name
+ */
+Queue.prototype.refreshKeys = function refreshKeys () {
+  var queue         = this
+  queue._prefix     = queue.prefix + 'rq:' + queue.name
+  return this
+}
 
 /**
  * Adds a new job to the queue.
@@ -60,207 +111,234 @@ exports.Queue = Queue;
  * @param {Object} payload: The data payload to enqueue.
  * @param {Function} callback
  */
-Queue.prototype.write = function (payload, callback) {
-  var self = this;
-
-  var id              = uuid()
-    , json            = JSON.stringify
-      ( { id          : id
-        , payload     : payload
-        , error_count : 0
-        , errors      : []
-        , modified    : Date.now()
-        }
-      )
+Queue.prototype.write = function write (payload, callback) {
+  var queue       = this
+  var now         = Date.now()
+  var job         = new Job(
+    queue
+  , { id          : uuid()
+    , status      : 'queued'
+    , priority    : 1
+    , timeout     : queue.timeout
+    , retries     : 0
+    , msg_count   : 0
+    , msgs        : []
+    , payload     : payload
+    , created     : now
+    , updated     : now
+    }
+  , true
+  )
 
   // Push the job.
-  self.client.multi()
-  self.client.rpush(self.prefix + 'queue:' + self.name, json);
-  self.client.publish(self.prefix + 'message', json)
-  self.client.exec(function (error) {
-    if (error) {
-      return handleError(error, callback);
+  job.forward('queued', callback)
+
+  return job
+}
+
+/**
+ * Get a job from uuid
+ *
+ * @param {String} uuid
+ * @param {Function} callback
+ */
+Queue.prototype.getJob = function getJob (uuid, callback) {
+  if (!callback) callback = asyncLog
+  var queue = this
+
+  function onData (error, data) {
+    if (error) return callback(error)
+
+    queue._returnJob(data, callback)
+  }
+
+  queue.client.hget(queue._prefix + ':jobs', uuid, onData)
+
+  return queue
+}
+
+/**
+ * Return a job from raw redis data
+ *
+ * @param {Buffer} data
+ * @param {Function} callback
+ */
+Queue.prototype._returnJob = function returnJob (data, callback) {
+  var queue = this
+
+  try {
+    data    = JSON.parse(data.toString())
+  } catch (error) {
+    return callback(error)
+  }
+
+  var job   = new Job(queue, data)
+
+  if (callback) callback(null, job)
+  return job
+}
+
+/**
+ * Overwrite resume to call _next
+ */
+Queue.prototype.resume = function resume () {
+  var queue     = this
+  queue.paused  = false
+  queue._next()
+
+  return true
+}
+
+/**
+ * Look for jobs
+ */
+Queue.prototype._next = function next () {
+  var queue = this
+
+  if (queue.paused) return
+
+  if (queue.processing >= queue.concurrency) {
+    return queue
+  }
+
+  ;++queue.processing
+
+  queue.bclient.blpop(queue._prefix + ':listen', queue.onPop)
+
+  return queue
+}
+
+/**
+ * Process a job. At this stage watch has been called on the queued sorted set
+ * and we have a job id.
+ */
+Queue.prototype._processJob = function processJob (job_id) {
+  var queue   = this
+  var client  = queue.client
+  var status  = 'running:' + queue.id
+  var now     = Date.now()
+
+  client.multi()
+  client.hget(queue._prefix + ':jobs', job_id)
+  client.zrem(queue._prefix + ':queued', job_id)
+  client.zadd(queue._prefix + ':' + status, now, job_id)
+
+  client.exec(function (error, results) {
+    if (error) return queue.emit('error', error)
+    if (results === null) {
+      client.watch(queue._prefix + ':queued')
+      return queue._processJob(job_id)
     }
 
-    if (callback) callback(null, id);
+    queue.emit('data', queue._returnJob(results[0]))
   })
-
-  return id;
-};
-
+}
 
 /**
- * Worker prototype used by the workers to listen for jobs.
- * Inherits from Filter.
- *
- * @constructor
- * @extends {Filter}
- * @param {Object} options: A hash that can contain name, host, port, auth, prefix
+ * Start the queue listener
  */
-var Worker = function (options) {
-  var self = this;
+Queue.prototype.listen = function listen (callback) {
+  var queue     = this
 
-  // Call parent
-  Filter.call(this);
+  queue.bclient = redis.createClient(queue.port, queue.host, queue.auth)
+  queue.bclient.on('error', queue._onError)
+  queue.started = new Date()
 
-  this.host        = options.host;
-  this.port        = options.port;
-  this.auth        = options.auth;
-  this.prefix      = options.prefix || '';
-  this.name        = options.name;
-  this.queues      = {};
-  this._current_id = null;
-  // TODO: Rename?
-  this.continual   = false;
-
-  // Client for use with child jobs.
-  this._child_client = redis.createClient(this.port, this.host, this.auth);
-
-  this._onError = function (error) {
-    if (error) {
-      self.emit('error', error);
+  queue.client.zadd(
+    queue._prefix + ':workers'
+  , queue.started.getTime()
+  , queue.id
+  , function (error) {
+      if (error) return self.emit('error', error)
+      if (callback) callback()
+      queue._next()
     }
+  )
+
+  return queue
+}
+
+/**
+ * Stop yol horses. Shut her down!
+ */
+Queue.prototype.end = function end () {
+  var queue     = this
+
+  if (queue.bclient) {
+    queue.bclient.destroy()
+    queue.bclient = null
   }
-
-  this._child_client.on('error', this._onError);
-
-  /**
-   * Callback for blpop responses.
-   *
-   * @private
-   * @param {Error} error: Possible error from Redis
-   * @param {Object} data: The data from redis.
-   */
-  this._onPop = function (error, data) {
-    if (error) {
-      return self.emit('error', error);
-    }
-
-    try {
-      data = JSON.parse(Buffer.isBuffer(data[1]) ? data[1].toString() : data[1]);
-      var job  = new Job(self, data);
-
-      if (!self.continual) {
-        self._current_id = job.id;
-        try {
-          self.client.hset(self.prefix + 'pending:' + self.name, job.id, JSON.stringify(job), self._onError);
-        } catch (error) {
-          self._onError(error);
-        }
-      }
-
-      self.emit('data', job);
-    } catch (json_error) {
-      self._onError(json_error);
-    }
-
-    if (!self.client.quitting && self.continual) {
-      // Listen for more jobs.
-      self.client.blpop(self.prefix + 'queue:' + self.name, 0, self._onPop);
-    }
-  };
-};
-
-// Inherits from Filter.
-util.inherits(Worker, Filter);
-
-/**
- * Creates a new Worker object.
- *
- * @param {Object} options: A hash that can contain name, host, port, auth, prefix
- * @returns {Worker}
- */
-exports.createWorker = function (options) {
-  return new Worker(options);
-};
-
-exports.Worker = Worker;
-
-/**
- * Listen for the next job. Only has to be called by user if `continual` is false.
- */
-Worker.prototype.next = function () {
-  if (this._current_id) {
-    this.client.hdel(this.prefix + 'pending:' + this.name, this._current_id, this._onError);
+  if (queue.sclient) {
+    queue.sclient.destroy()
+    queue.sclient = null
   }
+  queue.client.end()
 
-  this.client.blpop(this.prefix + 'queue:' + this.name, 0, this._onPop); 
-};
-
-/**
- * Start the worker
- */
-Worker.prototype.start = function () {
-  var self = this;
-
-  this.client = redis.createClient(this.port, this.host, this.auth);
-
-  this.client.on('error', function (error) {
-    self.emit('error', error);
-  });
-
-  this.next();
-};
-
-/**
- * Stop the worker
- */
-Worker.prototype.stop = function () {
-  this.client.destroy();
-};
-
+  return queue
+}
 
 /**
  * Job prototype used by the workers.
  *
  * @constructor
- * @param {Worker} worker: Parent prototype
+ * @param {Object} parent: Parent instance
  * @param {Object} payload: The data to set as the payload.
  */
-var Job = function (worker, data) {
-  this.id          = data.id;
-  this.payload     = data.payload;
-  this.error_count = data.error_count;
-  this.errors      = data.errors;
-  this.modified    = data.modified;
-  this.queue       = worker.name;
-  this.prefix      = worker.prefix;
+var Job = function (parent, data, is_new) {
+  var job         = this
+
+  job.id          = data.id
+  job.status      = data.status
+  job.priority    = +data.priority
+  job.timeout     = data.timeout
+  job.payload     = data.payload
+  job.retries     = data.retries
+  job.msg_count   = data.msg_count
+  job.msgs        = data.msgs
+  job.created     = data.created || Date.now()
+  job.updated     = data.updated
+
+  job.is_new      = is_new || false
+  job.old_status  = job.status
+
+  job.prefix      = parent.prefix
+  job._prefix     = parent._prefix
+  job.queue       = parent.name
 
   // Associate with a redis client.
-  this.parent = worker;
-};
+  job.parent      = parent
+  job.client      = parent.client
+}
 
-exports.Job = Job;
+exports.Job = Job
 
 /**
- * Add an error the the job.
+ * Add an message to the job.
+ *
+ * @param {String} message
+ */
+Job.prototype.addMessage = function addMessage (message) {
+  var job = this
+
+  ;++job.msg_count
+  job.msgs.push('INFO: ' + message)
+
+  return job
+}
+
+/**
+ * Add an error to the job.
  *
  * @param {Error} error: The error object to add.
  */
-Job.prototype.reportError = function (error) {
-  ++this.error_count;
-  this.errors.push(error.message ? error.message : error.toString());
-};
+Job.prototype.addError = function addError (error) {
+  var job = this
 
-/**
- * Re-process the job by adding back to the queue.
- *
- * @param {Function} callback: The optional callback
- */
-Job.prototype.retry = function (callback) {
-  var self = this;
+  ;++job.msg_count
+  job.msgs.push('ERROR: ' + (error.message || error.toString()))
 
-  this.parent._child_client.rpush(this.prefix + 'queue:' + this.queue, JSON.stringify({
-    id:          this.id,
-    payload:     this.payload,
-    error_count: this.error_count,
-    errors:      this.errors,
-    modified:    Date.now()
-  }), function (error) {
-    if (error)    return handleError(error, callback);
-    if (callback) callback(null, self.id);
-  });
-};
+  return job
+}
 
 /**
  * For JSON.stringify
@@ -268,11 +346,146 @@ Job.prototype.retry = function (callback) {
  * @return {Object}
  */
 Job.prototype.toJSON = function () {
-  return {
-    id:          this.id,
-    payload:     this.payload,
-    error_count: this.error_count,
-    errors:      this.errors,
-    modified:    this.modified
-  };
-};
+  var job       = this
+  return (
+    { id        : job.id
+    , status    : job.status
+    , priority  : job.priority
+    , payload   : job.payload
+    , retries   : job.retries
+    , msg_count : job.msg_count
+    , msgs      : job.msgs
+    , created   : job.created
+    , updated   : job.updated
+    }
+  )
+}
+
+/**
+ * Save a job.
+ *
+ * @param {Function} callback
+ */
+Job.prototype.save = function save (callback) {
+  var job     = this
+
+  job.updated = Date.now()
+
+  // We won't do a multi here, as usually it has been called elsewhere.
+  job.client.hset(
+    self.prefix + 'rq:' + self.queue + ':jobs'
+  , job.id
+  , JSON.stringify(job)
+  , callback
+  )
+
+  job.client.publish(self.prefix + 'rq:' + job.queue + ':save' , job.id)
+
+  return job
+}
+
+/**
+ * Forward job to another status set.
+ *
+ * @param {String} dest
+ * @param {Function} callback
+ */
+Job.prototype.forward = function forward (dest, callback) {
+  var job     = this
+  var client  = job.client
+  var score   = 0
+
+  job.status  = dest
+
+  if (!callback) {
+    callback  = job.parent._onError
+  }
+
+  if (job.is_new) {
+    client.multi()
+  } else {
+    client.watch(job._prefix + ':' + job.old_status)
+    client.multi()
+    client.zrem(job._prefix + ':' + job.old_status, job.id)
+  }
+
+  job.save()
+  score       = job.updated
+
+  // Queued items need to be listened for, and sorted set score assigned the
+  // job priority.
+  if ('queued' === job.status) {
+    score     = job.priority
+    client.rpush(job._prefix + ':listen', '1')
+  }
+
+  client.zadd(
+    job._prefix ':' + job.status
+  , score
+  , job.id
+  )
+  client.publish(job._prefix + ':' + job.status, job.id)
+
+  function onExec (error, data) {
+    if (error) return callback(error)
+    if (null === data) return job.forward(dest, callback)
+    callback(null, job)
+  }
+
+  client.exec(onExec)
+
+  return job
+}
+
+/**
+ * Re-process the job by adding back to the queue.
+ *
+ * @param {Function} callback: The optional callback
+ */
+Job.prototype.retry = function (error, callback) {
+  var job = this
+  if (job.timeout) cleartimeout(job.timeout)
+
+  if ('function' === typeof error) {
+    callback  = error
+    error     = null
+  }
+
+  ;++job.retries
+
+  if (error) {
+    job.addError(error)
+  }
+  job.addMessage('Retrying on "' + job.queue + ':' + job.parent.id + '".')
+
+  job.forward('queued', callback)
+
+  return job
+}
+
+/**
+ * Mark a job as done.
+ *
+ * @param {Error} error
+ */
+Job.prototype.done = function done (error) {
+  if (job.status === 'timeout') return
+
+  var job   = this
+  var dest  = ''
+
+  if (job.timeout) cleartimeout(job.timeout)
+
+  // Move to inactive list
+  if (error) {
+    job.addError(error)
+    dest    = 'failed'
+  } else {
+    job.addMessage('Done on "' + job.queue + ':' + job.parent.id + '".')
+    dest    = 'completed'
+  }
+
+  job.forward(dest, callback)
+
+  return job
+}
