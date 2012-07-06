@@ -55,7 +55,7 @@ var Queue = function (options) {
 
   // On blpop
   queue._onPop       = function onPop (error) {
-    if (error) return queue._done(error)
+    if (error) return queue._done(error, true)
     queue._next()
 
     queue.client.watch(queue._prefix + ':queued')
@@ -64,19 +64,19 @@ var Queue = function (options) {
 
   // On zrevrange
   function gotQueued (error, job_id) {
-    if (error) return queue._done(error)
+    if (error) return queue._done(error, true)
     if (!job_id || !job_id[0]) return queue._done()
 
     queue.client.hget(queue._prefix + ':jobs', job_id[0].toString(), gotJob)
   }
 
   function gotJob (error, data) {
-    if (error) return queue._done(error)
+    if (error) return queue._done(error, true)
 
     try {
       queue._processJob(queue._returnJob(data))
     } catch (error) {
-      return queue._done(error)
+      return queue._done(error, true)
     }
   }
 
@@ -281,12 +281,15 @@ Queue.prototype._next = function next () {
  *
  * @param @optional {Error} error
  */
-Queue.prototype._done = function done (error) {
+Queue.prototype._done = function done (error, premature) {
   var queue = this
 
   ;--queue.processing
   if (error) {
     queue.emit('error', error)
+  }
+  if (premature) {
+    queue.client.rpush(queue._prefix + ':listen', '1')
   }
 
   queue._next()
@@ -315,8 +318,8 @@ Queue.prototype._processJob = function processJob (job) {
   client.publish(queue._prefix + ':running' , job.id)
 
   client.exec(function (error, results) {
-    if (error) return queue._done(error)
-    if (results === null) return queue._done()
+    if (error) return queue._done(error, true)
+    if (results === null) return queue._done(null, true)
 
     if (job.timeout) {
       job._timer = setTimeout(job._onTimeout, job.timeout, job)
