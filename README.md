@@ -52,7 +52,7 @@ q.on('data', function (job) {
   // * Everytime a job changes (job.forward) status, a event named after the
   //   new status is emitted. E.g.
   //
-  //   * `queued`, `failed`, `complete`, `timeout`
+  //   * `queued`, `failed`, `complete`, `timeout`, `running`
   //
   // * Everytime a job is saved, a `save` event is emitted.
   //   If it is a new job, `new` is emitted as well.
