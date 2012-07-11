@@ -47,6 +47,8 @@ var Queue = function (options) {
   queue.bclient     = null
   queue.sclient     = null
 
+  queue._subbed     = {}
+
   queue._onError    = function onError (error) {
     if (error) {
       queue.emit('error', error)
@@ -54,7 +56,7 @@ var Queue = function (options) {
   }
 
   // On blpop
-  queue._onPop       = function onPop (error) {
+  queue._onPop      = function onPop (error) {
     if (error) return queue._done(error, true)
     queue._next()
 
@@ -157,6 +159,106 @@ Queue.prototype.migrate = function migrate (id, callback) {
   }
 
   client.zrange(queue._prefix + ':running:' + id, '0', '-1', onJobIds)
+
+  return queue
+}
+
+/**
+ * Parse an event, and check to see if is a default event or not.
+ * Create a mapping in `queue._subbed` and return it.
+ *
+ * @param {String} event
+ * @return {Object}
+ */
+Queue.prototype._parseEvent = function parseEvent (event) {
+  var queue       = this
+  var ret         =
+    { pattern     : true
+    }
+
+  switch (event) {
+  case 'running'  :
+  case 'queued'   :
+  case 'complete' :
+  case 'failed'   :
+  case 'timeout'  :
+  case 'save'     :
+  case 'new'      :
+    ret.pattern   = false
+    break
+  }
+
+  queue._subbed[event] = ret
+
+  return ret
+}
+
+/**
+ * Subscribe to a event
+ *
+ * @param {String} event
+ */
+Queue.prototype.subscribe = function subscribe (event) {
+  var queue = this
+
+  if (queue._subbed[event]) {
+    return queue
+  }
+
+  var key   = queue._prefix + ':' + event
+  var sub   = queue._parseEvent(event)
+
+  if (!queue.sclient) {
+    queue.sclient = redis.createClient(queue.port, queue.host, queue.auth)
+    queue.sclient.on('error', queue._onError)
+  }
+
+  if (sub.pattern) {
+    key         = key + ':*'
+    var pattern = 'pmessage:' + key
+    queue.sclient.psubscribe(key)
+    sub.fn      = function onPmessage (key, data) {
+      var id    = key.toString().split(':').pop()
+      queue.emit(event, id, data)
+    }
+    queue.sclient.on(pattern, sub.fn)
+  } else {
+    var channel = 'message:' + key
+    queue.sclient.subscribe(key)
+    sub.fn      = function onMessage (data) {
+      queue.emit(event, data.toString('ascii'))
+    }
+    queue.sclient.on(channel, sub.fn)
+  }
+
+  return queue
+}
+
+/**
+ * Unsubscribe to a event
+ *
+ * @param {String} event
+ */
+Queue.prototype.unsubscribe = function unsubscribe (event) {
+  var queue = this
+
+  if (!queue._subbed[event]) {
+    return queue
+  }
+
+  var key   = queue._prefix + ':' + event
+  var sub   = queue._subbed[event]
+
+  if (sub.pattern) {
+    key     = key + ':*'
+    queue.sclient.punsubscribe(key)
+    queue.sclient.removeListener('pmessage:' + key, sub.fn)
+  } else {
+    queue.sclient.unsubscribe(key)
+    queue.sclient.removeListener('message:' + key, sub.fn)
+  }
+
+  queue._subbed[event] = null
 
   return queue
 }
@@ -362,16 +464,23 @@ Queue.prototype.listen = function listen (callback) {
  * before shutting down your program.
  */
 Queue.prototype.end = function end (callback) {
-  var queue     = this
+  var queue       = this
 
   if (queue.bclient) {
     queue.bclient.destroy()
     queue.bclient = null
   }
   if (queue.sclient) {
-    queue.sclient.destroy()
+    var keys      = Object.keys(queue._subbed)
+    var key       = ''
+    for (var i = 0, il = keys.length; i < il; i++) {
+      key         = keys[i]
+      queue.unsubscribe(key)
+    }
+    queue.sclient.end()
     queue.sclient = null
   }
+  queue._subbed   = {}
   queue.client.zrem(queue._prefix + ':workers', queue.id)
   queue.client.end(callback)
 

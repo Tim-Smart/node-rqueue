@@ -3,7 +3,7 @@ var rq      = require('../')
 var q       = rq.createQueue(
   { name    : 'test'
   , prefix  : 'local:'
-  //, timeout : 5000
+  , timeout : 5000
   }
 )
 
@@ -17,6 +17,7 @@ q.once('data', function (job) {
 })
 
 function test2 (job) {
+  job.emit('custom', 123)
   job.retry()
   q.once('data', test3)
 }
@@ -30,6 +31,15 @@ function test3 (job) {
 }
 
 q.write('test')
+
+q.subscribe('running')
+q.on('running', function (job_id) {
+  console.log('Got running', job_id)
+})
+q.subscribe('custom')
+q.on('custom', function (job_id, data) {
+  console.log('Got custom', job_id, data.toString())
+})
 
 q.listen()
 
