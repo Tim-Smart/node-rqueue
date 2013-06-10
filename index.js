@@ -149,7 +149,7 @@ Queue.prototype.migrate = function migrate (id, callback) {
       try {
         queue
           ._returnJob(jobs[i])
-          .addMessage('Retry set on "' + queue.name + ':' + queue.id + '".')
+          .message('Retry set on "' + queue.name + ':' + queue.id + '".')
           .forward('queued', null, true)
       } catch (error) {}
     }
@@ -311,7 +311,7 @@ Queue.prototype.createJob = function createJob (payload) {
  * @param {String} uuid
  * @param {Function} callback
  */
-Queue.prototype.getJob = function getJob (uuid, callback) {
+Queue.prototype.job = function job (uuid, callback) {
   if (!callback) callback = asyncLog
   var queue = this
 
@@ -544,7 +544,7 @@ Job.prototype._onTimeout = function onTimeout (job) {
  *
  * @param {String} message
  */
-Job.prototype.addMessage = function addMessage (message) {
+Job.prototype.message = function message (message) {
   var job = this
 
   ;++job.msg_count
@@ -558,7 +558,7 @@ Job.prototype.addMessage = function addMessage (message) {
  *
  * @param {Error} error: The error object to add.
  */
-Job.prototype.addError = function addError (error) {
+Job.prototype.error = function error (error) {
   var job = this
 
   ;++job.msg_count
@@ -620,7 +620,7 @@ Job.prototype.save = function save (callback) {
   job.updated = Date.now()
 
   if (job.is_new) {
-    job.addMessage('Created on "' + job.queue + ':' + job.parent.id + '".')
+    job.message('Created on "' + job.queue + ':' + job.parent.id + '".')
     client.publish(job._prefix + ':new', job.id)
   }
 
@@ -715,9 +715,9 @@ Job.prototype.retry = function (error, callback) {
   ;++job.retries
 
   if (error) {
-    job.addError(error)
+    job.error(error)
   }
-  job.addMessage('Retry set on "' + job.queue + ':' + job.parent.id + '".')
+  job.message('Retry set on "' + job.queue + ':' + job.parent.id + '".')
 
   job.forward('queued', callback)
   job.parent._done()
@@ -745,10 +745,10 @@ Job.prototype.done = function done (error, callback) {
 
   // Move to inactive list
   if (error) {
-    job.addError(error)
+    job.error(error)
     dest    = 'failed'
   } else {
-    job.addMessage('Done on "' + job.queue + ':' + job.parent.id + '".')
+    job.message('Done on "' + job.queue + ':' + job.parent.id + '".')
     dest    = 'completed'
   }
 
