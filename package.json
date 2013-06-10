@@ -1,6 +1,6 @@
 { "name"          : "rqueue"
 , "description"   : "A node.js implementation of RQueue, includes Worker and Queue."
-, "version"       : "0.2.0"
+, "version"       : "0.3.0"
 , "author"        : "Tim Smart <tim@fostle.com>"
 , "main"          : "./"
 , "dependencies"  :
