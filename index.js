@@ -271,7 +271,7 @@ Queue.prototype.unsubscribe = function unsubscribe (event) {
  */
 Queue.prototype.write = function write (payload, callback) {
   var queue       = this
-  var job         = queue.createJob(payload)
+  var job         = queue.job(payload)
 
   job.forward('queued', callback)
 
@@ -283,7 +283,7 @@ Queue.prototype.write = function write (payload, callback) {
  *
  * @param {Object} payload
  */
-Queue.prototype.createJob = function createJob (payload) {
+Queue.prototype.job = function job (payload) {
   var queue       = this
   var now         = Date.now()
   var job         = new Job(
@@ -311,7 +311,7 @@ Queue.prototype.createJob = function createJob (payload) {
  * @param {String} uuid
  * @param {Function} callback
  */
-Queue.prototype.job = function job (uuid, callback) {
+Queue.prototype.findJob = function findJob (uuid, callback) {
   if (!callback) callback = asyncLog
   var queue = this
 
