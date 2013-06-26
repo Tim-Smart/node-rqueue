@@ -7,7 +7,7 @@ node-rqueue is a simple Redis based work queue for communicating between multipl
 Usage
 -----
 
-```js
+```javascript
 var rq      = require('rqueue')
 var assert  = require('assert').ok
 var q       = q.createQueue(
@@ -76,7 +76,7 @@ q.write({ my : 'data' })
 // Callback can be used as second argument.
 
 // Create a job and mess with individual options.
-var job = q.createJob({ my : 'data' })
+var job = q.job({ my : 'data' })
 assert(null === job.status)
 assert(0 === job.retries)
 
@@ -89,15 +89,15 @@ assert(1 === job.priority)
 job.priority = 9001 // Over 9000
 
 // Add some messages
-job.addMessage('Custom info message')
-job.addError(new Error('fail'))
+job.message('Custom info message')
+job.error(new Error('fail'))
 
 // Save the job and push it to the 'queued' status
 job.forward('queued', function (error) {
   if (error) throw error
 
   // Get a job from an id
-  q.getJob(job.id, function (error, job) {})
+  q.findJob(job.id, function (error, job) {})
 })
 assert('queued' === job.status)
 
